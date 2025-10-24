@@ -47,5 +47,4 @@ if __name__ == "__main__":
     story = generate_story(character, setting, theme)
     print("\nHere's your story:\n")
     print(story)
-    print(story)
 
