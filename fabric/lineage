@@ -1,0 +1,365 @@
+# Fabric Data Lineage Extraction Notebook
+
+# This notebook extracts source and target details from Fabric pipelines and notebooks
+
+# ============================================================================
+
+# STEP 1: Install Required Packages
+
+# ============================================================================
+
+# %pip install msal requests pandas
+
+# ============================================================================
+
+# STEP 2: Authentication Setup
+
+# ============================================================================
+
+import msal
+import requests
+import json
+import pandas as pd
+from datetime import datetime
+
+def get_fabric_access_token(tenant_id, client_id, client_secret):
+“””
+Get access token for Fabric API using Service Principal
+“””
+authority = f”https://login.microsoftonline.com/{tenant_id}”
+scope = [“https://api.fabric.microsoft.com/.default”]
+
+```
+app = msal.ConfidentialClientApplication(
+    client_id,
+    authority=authority,
+    client_credential=client_secret
+)
+
+result = app.acquire_token_for_client(scopes=scope)
+
+if "access_token" in result:
+    return result["access_token"]
+else:
+    raise Exception(f"Authentication failed: {result.get('error_description')}")
+```
+
+# ============================================================================
+
+# STEP 3: Configuration
+
+# ============================================================================
+
+# Option 1: Service Principal Authentication
+
+TENANT_ID = “your-tenant-id”
+CLIENT_ID = “your-client-id”
+CLIENT_SECRET = “your-client-secret”
+WORKSPACE_ID = “your-workspace-id”
+
+# Get access token
+
+access_token = get_fabric_access_token(TENANT_ID, CLIENT_ID, CLIENT_SECRET)
+
+# Option 2: If running in Fabric notebook, use built-in authentication
+
+try:
+from notebookutils import mssparkutils
+access_token = mssparkutils.credentials.getToken(“https://api.fabric.microsoft.com”)
+WORKSPACE_ID = mssparkutils.env.getWorkspaceId()
+print(f”Using workspace: {WORKSPACE_ID}”)
+except:
+print(“Using service principal authentication”)
+
+# ============================================================================
+
+# STEP 4: Helper Functions for Lineage Extraction
+
+# ============================================================================
+
+def get_all_pipelines(workspace_id, access_token):
+“”“Get all data pipelines in workspace”””
+url = f”https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}/items?type=DataPipeline”
+headers = {
+‘Authorization’: f’Bearer {access_token}’,
+‘Content-Type’: ‘application/json’
+}
+
+```
+response = requests.get(url, headers=headers)
+if response.status_code == 200:
+    return response.json().get('value', [])
+return []
+```
+
+def get_pipeline_definition(workspace_id, pipeline_id, access_token):
+“”“Get pipeline definition”””
+url = f”https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}/items/{pipeline_id}/getDefinition”
+headers = {
+‘Authorization’: f’Bearer {access_token}’,
+‘Content-Type’: ‘application/json’
+}
+
+```
+response = requests.post(url, headers=headers)
+if response.status_code == 200:
+    return response.json()
+return {}
+```
+
+def extract_pipeline_lineage(pipeline_def, pipeline_name):
+“”“Extract lineage from pipeline definition”””
+lineage_records = []
+
+```
+# Parse pipeline JSON
+definition_parts = pipeline_def.get('definition', {}).get('parts', [])
+
+for part in definition_parts:
+    if part.get('path') == 'pipeline-content.json':
+        payload = part.get('payload')
+        if payload:
+            pipeline_content = json.loads(payload)
+            activities = pipeline_content.get('properties', {}).get('activities', [])
+            
+            for activity in activities:
+                record = extract_activity_lineage(activity, pipeline_name)
+                if record:
+                    lineage_records.append(record)
+
+return lineage_records
+```
+
+def extract_activity_lineage(activity, pipeline_name):
+“”“Extract lineage from individual activity”””
+activity_type = activity.get(‘type’)
+activity_name = activity.get(‘name’)
+
+```
+record = {
+    'pipeline_name': pipeline_name,
+    'activity_name': activity_name,
+    'activity_type': activity_type,
+    'source': '',
+    'source_type': '',
+    'target': '',
+    'target_type': '',
+    'transformation': '',
+    'timestamp': datetime.now().isoformat()
+}
+
+# Copy Data Activity
+if activity_type == 'Copy':
+    source = activity.get('typeProperties', {}).get('source', {})
+    sink = activity.get('typeProperties', {}).get('sink', {})
+    
+    record['source_type'] = source.get('type', '')
+    record['target_type'] = sink.get('type', '')
+    
+    # Get source details
+    inputs = activity.get('inputs', [])
+    if inputs:
+        record['source'] = inputs[0].get('referenceName', '')
+    
+    # Get target details
+    outputs = activity.get('outputs', [])
+    if outputs:
+        record['target'] = outputs[0].get('referenceName', '')
+    
+    # Get query/table info
+    if 'query' in source:
+        record['transformation'] = f"Query: {source.get('query')}"
+    if 'table' in source:
+        record['source'] += f".{source.get('table')}"
+    if 'table' in sink:
+        record['target'] += f".{sink.get('table')}"
+
+# Notebook Activity
+elif activity_type in ['SynapseNotebook', 'DatabricksNotebook']:
+    type_props = activity.get('typeProperties', {})
+    notebook = type_props.get('notebook', {})
+    record['source'] = notebook.get('referenceName', 'Unknown Notebook')
+    record['source_type'] = 'Notebook'
+    
+    # Extract parameters
+    params = type_props.get('parameters', {})
+    param_str = ', '.join([f"{k}={v.get('value')}" for k, v in params.items()])
+    record['transformation'] = f"Parameters: {param_str}"
+
+# Dataflow Activity
+elif activity_type == 'ExecuteDataFlow':
+    type_props = activity.get('typeProperties', {})
+    dataflow = type_props.get('dataflow', {})
+    record['source'] = dataflow.get('referenceName', 'Unknown Dataflow')
+    record['source_type'] = 'Dataflow'
+
+return record
+```
+
+# ============================================================================
+
+# STEP 5: Extract Lineage from All Pipelines
+
+# ============================================================================
+
+print(“Starting lineage extraction…”)
+all_lineage = []
+
+# Get all pipelines
+
+pipelines = get_all_pipelines(WORKSPACE_ID, access_token)
+print(f”Found {len(pipelines)} pipelines”)
+
+# Process each pipeline
+
+for pipeline in pipelines:
+pipeline_id = pipeline.get(‘id’)
+pipeline_name = pipeline.get(‘displayName’)
+
+```
+print(f"\nProcessing: {pipeline_name}")
+
+# Get pipeline definition
+pipeline_def = get_pipeline_definition(WORKSPACE_ID, pipeline_id, access_token)
+
+# Extract lineage
+lineage_records = extract_pipeline_lineage(pipeline_def, pipeline_name)
+all_lineage.extend(lineage_records)
+
+print(f"  - Found {len(lineage_records)} activities")
+```
+
+# ============================================================================
+
+# STEP 6: Create Lineage DataFrame
+
+# ============================================================================
+
+lineage_df = pd.DataFrame(all_lineage)
+
+print(”\n” + “=”*80)
+print(“LINEAGE EXTRACTION COMPLETE”)
+print(”=”*80)
+print(f”\nTotal activities tracked: {len(lineage_df)}”)
+print(f”\nActivity type breakdown:”)
+print(lineage_df[‘activity_type’].value_counts())
+
+print(”\n\nSample lineage records:”)
+print(lineage_df.head(10))
+
+# ============================================================================
+
+# STEP 7: Export Lineage Data
+
+# ============================================================================
+
+# Export to CSV
+
+lineage_df.to_csv(‘fabric_lineage.csv’, index=False)
+print(”\n✓ Exported to fabric_lineage.csv”)
+
+# Export to JSON
+
+lineage_json = lineage_df.to_dict(‘records’)
+with open(‘fabric_lineage.json’, ‘w’) as f:
+json.dump(lineage_json, f, indent=2)
+print(“✓ Exported to fabric_lineage.json”)
+
+# ============================================================================
+
+# STEP 8: Create Lineage Visualization
+
+# ============================================================================
+
+# Create a simple lineage graph structure
+
+def create_lineage_graph(df):
+“”“Create lineage graph structure”””
+graph = {
+‘nodes’: [],
+‘edges’: []
+}
+
+```
+node_ids = set()
+
+for _, row in df.iterrows():
+    # Add source node
+    if row['source'] and row['source'] not in node_ids:
+        graph['nodes'].append({
+            'id': row['source'],
+            'type': row['source_type'],
+            'label': row['source']
+        })
+        node_ids.add(row['source'])
+    
+    # Add target node
+    if row['target'] and row['target'] not in node_ids:
+        graph['nodes'].append({
+            'id': row['target'],
+            'type': row['target_type'],
+            'label': row['target']
+        })
+        node_ids.add(row['target'])
+    
+    # Add edge
+    if row['source'] and row['target']:
+        graph['edges'].append({
+            'from': row['source'],
+            'to': row['target'],
+            'pipeline': row['pipeline_name'],
+            'activity': row['activity_name']
+        })
+
+return graph
+```
+
+lineage_graph = create_lineage_graph(lineage_df)
+
+print(f”\nLineage graph created:”)
+print(f”  - Nodes: {len(lineage_graph[‘nodes’])}”)
+print(f”  - Edges: {len(lineage_graph[‘edges’])}”)
+
+# Save graph
+
+with open(‘fabric_lineage_graph.json’, ‘w’) as f:
+json.dump(lineage_graph, f, indent=2)
+print(“✓ Exported graph to fabric_lineage_graph.json”)
+
+# ============================================================================
+
+# STEP 9: Generate Lineage Summary Report
+
+# ============================================================================
+
+print(”\n” + “=”*80)
+print(“LINEAGE SUMMARY REPORT”)
+print(”=”*80)
+
+# Source summary
+
+print(”\n📥 SOURCES:”)
+sources = lineage_df[lineage_df[‘source’] != ‘’][‘source’].value_counts()
+for source, count in sources.head(10).items():
+print(f”  {source}: {count} references”)
+
+# Target summary
+
+print(”\n📤 TARGETS:”)
+targets = lineage_df[lineage_df[‘target’] != ‘’][‘target’].value_counts()
+for target, count in targets.head(10).items():
+print(f”  {target}: {count} writes”)
+
+# Pipeline summary
+
+print(”\n🔄 PIPELINES:”)
+pipelines_summary = lineage_df.groupby(‘pipeline_name’).size()
+for pipeline, count in pipelines_summary.items():
+print(f”  {pipeline}: {count} activities”)
+
+print(”\n” + “=”*80)
+print(“Lineage extraction complete! Files saved:”)
+print(”  - fabric_lineage.csv”)
+print(”  - fabric_lineage.json”)
+print(”  - fabric_lineage_graph.json”)
+print(”=”*80)
